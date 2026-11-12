@@ -198,6 +198,7 @@ h3{font-family:"Barlow Condensed",sans-serif;font-size:20px;margin:18px 0 8px;le
 </section>
 
 <section id="view-bt" hidden>
+  <div class="top" id="wPanel"></div>
   <div class="toolbar">
     <label>Last day <input type="date" id="btDate"></label>
     <label>Days <select id="btDays"><option value="1">1 (just that day)</option><option value="3">3</option><option value="7">7</option><option value="14">14</option></select></label>
@@ -309,6 +310,9 @@ function defForStat(stat,oppId){
   }
   return null;
 }
+const DEFAULT_W={hist:.30,match:.25,form:.15,usage:.15,def:.10,env:.05};
+const W=()=>S.weights||DEFAULT_W;
+const wPct=k=>Math.round(100*W()[k]/Object.values(W()).reduce((a,b)=>a+b,0));
 const CATS = [
   ['hist','Historical vs. line'],
   ['form','Consistency & form'],
@@ -322,7 +326,7 @@ const CATS = [
 const S = {
   date:null, games:[], teams:{}, ranks:{}, nTeams:30, players:[],
   logs:{}, logP:{}, stat:'PTS', side:'over', win:10, thr:8,
-  lines:load('pl_lines',{}), sides:load('pl_sides',{}),
+  lines:load('pl_lines',{}), sides:load('pl_sides',{}), weights:load('pl_weights',null),
   picks:load('pl_picks',[]), sort:{k:'star',dir:-1}, game:'', open:null, leagueTotal:226,
 };
 
@@ -589,7 +593,8 @@ function analyze(p,stat,line,side,N){
   C.env={s:clamp(over?env:11-env,1,10),note:eb.join(' · ')+'.'};
 
   for(const k in C) C[k].s=r1(C[k].s);
-  const score=r1(mean(Object.values(C).map(c=>c.s)));
+  const w=W(); let ws=0,wt=0; for(const k in C){const x=w[k]??0; ws+=C[k].s*x; wt+=x}
+  const score=r1(wt?ws/wt:mean(Object.values(C).map(c=>c.s)));
   return {games,vals,avg,hits,hr,margin,sdev,l5avg,l5hr,homeG,awayG,winG,lossG,vsOpp,avgMin,C,score,rate,f,hitF,line,side,stat};
 }
 const sc=s=>s>=S.thr?'s-hi':s>=5.5?'s-mid':'s-lo';
@@ -814,7 +819,7 @@ function renderDetail(){
       <button class="btn primary" id="addPick">+ Add to my picks</button>
     </div>
     <div class="cats">${CATS.map(([k,l],i)=>{const c=a.C[k];const col=c.s>=S.thr?'var(--green)':c.s>=5.5?'var(--amber)':'var(--red)';
-      return `<div class="cat"><div class="top"><span>${i+1}. ${l}</span><span style="color:${col}">${c.s.toFixed(1)}</span></div><div class="bar"><i style="width:${c.s*10}%;background:${col}"></i></div><p>${esc(c.note)}</p></div>`}).join('')}</div>
+      return `<div class="cat"><div class="top"><span>${i+1}. ${l} <small class="muted" style="font-weight:500">· ${wPct(k)}% of score</small></span><span style="color:${col}">${c.s.toFixed(1)}</span></div><div class="bar"><i style="width:${c.s*10}%;background:${col}"></i></div><p>${esc(c.note)}</p></div>`}).join('')}</div>
     <h3>Splits (last ${a.games.length})</h3>
     <div class="splits">${splitBox('Home',a.homeG,a)}${splitBox('Away',a.awayG,a)}${splitBox('In wins',a.winG,a)}${splitBox('In losses',a.lossG,a)}${splitBox('Vs '+esc(p.opp)+' (recent)',a.vsOpp,a)}</div>
     <h3>Game log</h3>
@@ -968,6 +973,7 @@ async function runBacktest(){
   }catch(e){btStatus('Something went wrong: '+e.message)}
   finally{Object.assign(S,saved);S.bt=false;$('#btRun').disabled=false}
   renderBacktest(rows,end,days,statSel,dayCount);
+  if(S.autoCal){S.autoCal=false;if(S.btSuggest){applyWeights(S.btSuggest,'Auto-calibrated from the last 14 days')}}
   renderTable();
 }
 function renderBacktest(rows,end,days,statSel,dayCount){
@@ -981,6 +987,10 @@ function renderBacktest(rows,end,days,statSel,dayCount){
     return {label,c,hi:hr(hi),hiN:hi.length,lo:hr(lo),loN:lo.length,lift:(hr(hi)!=null&&hr(lo)!=null)?hr(hi)-hr(lo):null};
   };
   const cats=CATS.map(([k,l])=>metric(l,r=>r.s[k]));
+  // Suggested weights: proportional to each category's correlation (3% floor so nothing is fully dropped)
+  {const raw={};CATS.forEach(([k],i)=>raw[k]=Math.max(cats[i].c,0.01));const t=Object.values(raw).reduce((a,b)=>a+b,0);
+   const sw={};for(const k in raw)sw[k]=Math.max(0.03,raw[k]/t);const t2=Object.values(sw).reduce((a,b)=>a+b,0);for(const k in sw)sw[k]=Math.round(1000*sw[k]/t2)/1000;
+   S.btSuggest=statSel?null:sw; S.btSuggestN=rows.length;}
   const overall=metric('Overall pick score',r=>r.overall);
   const sorted=[...cats].sort((a,b)=>a.c-b.c);
   const least=sorted[0], most=sorted[sorted.length-1];
@@ -1003,11 +1013,26 @@ function renderBacktest(rows,end,days,statSel,dayCount){
     <td class="num">${fp(m.hi)} <small class="muted">(${m.hiN})</small></td><td class="num">${fp(m.lo)} <small class="muted">(${m.loN})</small></td>
     <td class="num ${m.lift==null?'':m.lift>=0?'hit':'miss'}">${m.lift==null?'—':(m.lift>=0?'+':'')+Math.round(m.lift*100)+' pts'}</td><td>${impact(m.c)}</td></tr>`).join('')}
   </tbody></table></div>
+  ${S.btSuggest?`<div class="overall"><div style="flex:1;min-width:260px"><b>Weights these results suggest</b><div class="muted" style="margin-top:4px">${CATS.map(([k,l])=>`${esc(l)} <b style="color:var(--text)">${Math.round(S.btSuggest[k]*100)}%</b>`).join(' · ')}</div>${dayCount<7?`<div class="muted" style="font-size:12px;margin-top:4px">Only ${dayCount} day${dayCount>1?'s':''} of games — results this small can be noise. 14 days is safer.</div>`:''}</div><button class="btn primary" id="btApply">Use these weights</button></div>`:'<p class="note">Pick "All stats" to get suggested weights.</p>'}
   <p class="note">How to read it: correlation near 0 means that category's score had no relationship with whether the Over hit; positive means higher scores hit more; negative means it pointed the wrong way. One day is a small sample (a few hundred picks) — run 7 or 14 days for a steadier answer. Limits: lines are each player's recent-average line, not sportsbook lines; players who didn't play are treated as having been out; team defense and standings use today's season numbers.</p>`;
 }
 $('#btStat').innerHTML='<option value="">All stats</option>'+STATS.map(s=>`<option value="${s.k}">${s.k}</option>`).join('');
 {const y=new Date();y.setDate(y.getDate()-1);$('#btDate').value=localYMD(y);}
 $('#btRun').onclick=runBacktest;
+function applyWeights(w,how){S.weights=w;save('pl_weights',w);S.weightsHow=how;save('pl_weights_how',how);renderWeights();renderTable();toast('Weights updated')}
+function renderWeights(){
+  const how=S.weights?(load('pl_weights_how','Custom')):'Recommended starting weights';
+  $('#wPanel').innerHTML=`<h4>Current scoring weights <small class="muted" style="font-family:Inter;font-size:12px;font-weight:500">· ${esc(how)}</small></h4>
+   <div class="list">${CATS.map(([k,l])=>`<div class="tp" style="cursor:default"><span class="pill s-mid" style="min-width:52px">${wPct(k)}%</span><b>${esc(l)}</b></div>`).join('')}</div>
+   <div class="hgroup" style="margin-top:10px"><button class="btn primary" id="wAuto">Auto-calibrate from last 14 days</button><button class="btn" id="wReset">Reset to recommended</button>
+   <span class="muted" style="font-size:12px">Auto-calibrate runs a 14-day backtest, then sets each category's weight by how well it predicted real results.</span></div>`;
+}
+$('#wPanel').onclick=e=>{
+  if(e.target.closest('#wReset')){S.weights=null;save('pl_weights',null);renderWeights();renderTable();toast('Reset to recommended weights');return}
+  if(e.target.closest('#wAuto')){if(S.bt)return;const y=new Date();y.setDate(y.getDate()-1);$('#btDate').value=localYMD(y);$('#btDays').value='14';$('#btStat').value='';S.autoCal=true;runBacktest()}
+};
+$('#btOut').addEventListener('click',e=>{if(e.target.closest('#btApply')&&S.btSuggest)applyWeights(S.btSuggest,`From backtest of ${S.btSuggestN} picks`)});
+renderWeights();
 
 $('#date').value=localYMD(new Date());
 renderTable();
