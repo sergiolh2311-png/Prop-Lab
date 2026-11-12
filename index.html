@@ -152,6 +152,7 @@ h3{font-family:"Barlow Condensed",sans-serif;font-size:20px;margin:18px 0 8px;le
   <nav id="nav">
     <button data-view="board" class="active">Board</button>
     <button data-view="picks">My Picks</button>
+    <button data-view="bt">Backtest</button>
   </nav>
 </header>
 
@@ -194,6 +195,17 @@ h3{font-family:"Barlow Condensed",sans-serif;font-size:20px;margin:18px 0 8px;le
     </table>
   </div>
   <p class="note">Data: ESPN public feeds (scoreboard, rosters, injuries, game logs, standings). Defensive pressure ranks the opponent on the stat you are viewing (steals allowed for STL, rebounds allowed for REB, etc.) from ESPN team opponent stats, or from players' game logs vs that team if that feed is unavailable. Scores are a framework for judging picks, not a guarantee.</p>
+</section>
+
+<section id="view-bt" hidden>
+  <div class="toolbar">
+    <label>Last day <input type="date" id="btDate"></label>
+    <label>Days <select id="btDays"><option value="1">1 (just that day)</option><option value="3">3</option><option value="7">7</option><option value="14">14</option></select></label>
+    <label>Stat <select id="btStat"><option value="">All stats</option></select></label>
+    <button class="btn primary" id="btRun">Run backtest</button>
+    <span class="muted" id="btStatus"></span>
+  </div>
+  <div id="btOut"><div class="empty">Pick a date (yesterday is preselected) and press <b>Run backtest</b>. It scores every player who played as of before that day's games, using each player's recent-average line and the Over, then checks what actually happened.</div></div>
 </section>
 
 <section id="view-picks" hidden>
@@ -686,6 +698,7 @@ function renderTop(Q){
     ${all.length>24?`<button class="btn small" id="topMore">${S.topAll?'Show fewer':`Show all ${all.length}`}</button>`:''}</div></div>`;
 }
 function renderTable(){
+  if(S.bt) return;
   const tb=$('#tbl tbody');
   if(!S.players.length){tb.innerHTML=`<tr><td colspan="10" class="empty">${S.games.length?'Loading players…':'No players loaded yet.'}</td></tr>`;return}
   let rows=visiblePlayers().map(rowData);
@@ -890,13 +903,105 @@ $('#modal').addEventListener('change',e=>{if(e.target.id==='dLine'&&S.open){setL
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('#modal').hidden){$('#modal').hidden=true;S.open=null;renderTable()}});
 $('#nav').onclick=e=>{const b=e.target.closest('button');if(!b)return;
   document.querySelectorAll('#nav button').forEach(x=>x.classList.toggle('active',x===b));
-  $('#view-board').hidden=b.dataset.view!=='board';$('#view-picks').hidden=b.dataset.view!=='picks';
+  ['board','picks','bt'].forEach(v=>$('#view-'+v).hidden=b.dataset.view!==v);
   if(b.dataset.view==='picks')renderPicks()};
 $('#pickList').onclick=e=>{
   const r=e.target.closest('[data-res]');if(r){const p=S.picks.find(x=>x.id===r.dataset.pk);p.result=p.result===r.dataset.res?null:r.dataset.res;save('pl_picks',S.picks);renderPicks();return}
   const d=e.target.closest('[data-del]');if(d){S.picks=S.picks.filter(x=>x.id!==d.dataset.del);save('pl_picks',S.picks);renderPicks()}
 };
 $('#gradeBtn').onclick=autoGrade;
+
+/* ============ backtest: which categories actually predicted results ============ */
+function btStatus(m){$('#btStatus').textContent=m}
+function corr(xs,ys){const mx=mean(xs),my=mean(ys);let sxy=0,sxx=0,syy=0;for(let i=0;i<xs.length;i++){const a=xs[i]-mx,b=ys[i]-my;sxy+=a*b;sxx+=a*a;syy+=b*b}return sxx&&syy?sxy/Math.sqrt(sxx*syy):0}
+async function runBacktest(){
+  if(S.bt) return;
+  const end=$('#btDate').value, days=+$('#btDays').value, statSel=$('#btStat').value;
+  $('#btRun').disabled=true; S.bt=true;
+  const saved={date:S.date,games:S.games,players:S.players,form:S.form,leagueTotal:S.leagueTotal,win:S.win};
+  const rows=[]; let dayCount=0;
+  try{
+    if(!Object.keys(S.ranks||{}).length){try{S.ranks=parseStandings(await getJSON(STANDINGS))}catch(e){}}
+    if(!S.oppStats){S.date=end;try{await loadOppStats()}catch(e){}}
+    for(let i=days-1;i>=0;i--){
+      const d=new Date(end+'T12:00:00'); d.setDate(d.getDate()-i); const ymd=localYMD(d);
+      btStatus(`${fmtShort(ymd)}: loading games…`);
+      let games=[];
+      try{games=((await getJSON(`${SITE}/scoreboard?dates=${ymd.replace(/-/g,'')}`)).events||[]).map(parseEvent).filter(g=>g.state==='post')}catch(e){}
+      if(!games.length) continue;
+      dayCount++;
+      const players=[];
+      await Promise.all(games.flatMap(g=>[[g.home,g.away,true],[g.away,g.home,false]].map(async([t,o,home])=>{
+        try{const j=await getJSON(`${SITE}/teams/${t.id}/roster`);
+          flattenAthletes(j.athletes).forEach(a=>players.push({id:String(a.id),name:a.displayName||a.fullName,short:a.shortName||a.displayName,
+            pos:(a.position&&a.position.abbreviation)||'',teamId:t.id,team:t.abbr,oppId:o.id,opp:o.abbr,home,gameId:g.id,inj:''}));}catch(e){}
+      })));
+      const list=players.filter(p=>!S.logs[p.id]); const total=list.length; let done=0;
+      const worker=async()=>{while(list.length){const p=list.shift();await ensureLog(p);done++;btStatus(`${fmtShort(ymd)}: loading player game logs ${done}/${total}…`)}};
+      await Promise.all(Array.from({length:6},worker));
+      // Who actually played that day (players who didn't are treated as out, so teammates get the opportunity bump)
+      const actual={};
+      players.forEach(p=>{const g=(S.logs[p.id]||[]).find(x=>localYMD(new Date(x.date))===ymd);if(g&&g.min>0)actual[p.id]=g;else p.inj='Out'});
+      S.date=ymd; S.games=games; S.players=players; S.win=10;
+      const tt=games.map(g=>g.total).filter(Boolean); S.leagueTotal=tt.length>=2?mean(tt):226;
+      S.form={}; await Promise.all(games.flatMap(g=>[g.home,g.away]).map(t=>loadTeamForm(t).then(f=>{S.form[t.id]=f})));
+      btStatus(`${fmtShort(ymd)}: scoring picks…`);
+      for(const p of players){
+        const g=actual[p.id]; if(!g) continue;
+        const prior=gamesBefore(p.id); if(!prior||prior.length<5) continue;
+        for(const st of STATS){
+          if(statSel&&st.k!==statSel) continue;
+          const line=defaultLine(p.id,st.k);
+          const a=analyze(p,st.k,line,'over',10); if(!a) continue;
+          const v=st.f(g);
+          const sc={}; CATS.forEach(([k])=>sc[k]=a.C[k].s);
+          rows.push({date:ymd,name:p.name,stat:st.k,line,v,hit:v>line?1:0,s:sc,overall:a.score});
+        }
+      }
+    }
+  }catch(e){btStatus('Something went wrong: '+e.message)}
+  finally{Object.assign(S,saved);S.bt=false;$('#btRun').disabled=false}
+  renderBacktest(rows,end,days,statSel,dayCount);
+  renderTable();
+}
+function renderBacktest(rows,end,days,statSel,dayCount){
+  const out=$('#btOut');
+  if(!rows.length){btStatus('');out.innerHTML=`<div class="empty">No finished games found for that date range.</div>`;return}
+  const hits=rows.map(r=>r.hit), base=mean(hits);
+  const metric=(label,get)=>{
+    const xs=rows.map(get), c=corr(xs,hits);
+    const hi=rows.filter(r=>get(r)>=7), lo=rows.filter(r=>get(r)<=4);
+    const hr=a=>a.length?mean(a.map(r=>r.hit)):null;
+    return {label,c,hi:hr(hi),hiN:hi.length,lo:hr(lo),loN:lo.length,lift:(hr(hi)!=null&&hr(lo)!=null)?hr(hi)-hr(lo):null};
+  };
+  const cats=CATS.map(([k,l])=>metric(l,r=>r.s[k]));
+  const overall=metric('Overall pick score',r=>r.overall);
+  const sorted=[...cats].sort((a,b)=>a.c-b.c);
+  const least=sorted[0], most=sorted[sorted.length-1];
+  const impact=c=>Math.abs(c)<0.05?'no real impact':c<0?(c<=-0.15?'worked backwards (higher score → more misses)':'slightly backwards'):c<0.15?'a weak positive effect':'a meaningful positive effect';
+  const fp=v=>v==null?'—':pct(v);
+  const thrRows=rows.filter(r=>r.overall>=S.thr);
+  const bar=c=>{const w=Math.min(50,Math.abs(c)/0.4*50);return `<div style="position:relative;height:14px;background:#0d1320;border-radius:4px"><div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:#3a4a6b"></div><div style="position:absolute;top:2px;bottom:2px;${c>=0?'left:50%':'right:50%'};width:${w}%;background:${c>=0.05?'var(--green)':c<=-0.05?'var(--red)':'var(--muted)'};border-radius:3px"></div></div>`};
+  const range=days>1?`${dayCount} game days ending ${fmtShort(end)}`:fmtShort(end);
+  btStatus('');
+  out.innerHTML=`
+  <div class="overall" style="margin-top:0;display:block">
+    <div class="muted" style="font-size:12px;text-transform:uppercase;letter-spacing:.06em">Result · ${esc(range)} · ${statSel||'all stats'} · ${rows.length} player-stat picks (Over at each player's recent-average line)</div>
+    <div style="font-size:16px;margin-top:6px"><b>Mattered least:</b> <span class="miss">${esc(least.label)}</span> — ${impact(least.c)} (correlation ${least.c.toFixed(2)}; scored 7+ hit ${fp(least.hi)} vs scored 4 or less hit ${fp(least.lo)}).</div>
+    <div style="font-size:16px;margin-top:4px"><b>Mattered most:</b> <span class="hit">${esc(most.label)}</span> — ${impact(most.c)} (correlation ${most.c.toFixed(2)}; 7+ hit ${fp(most.hi)} vs 4 or less ${fp(most.lo)}).</div>
+    <div class="muted" style="margin-top:6px">All Overs hit ${pct(base)} of the time. Picks with an overall score ≥ ${S.thr}: ${thrRows.length?`${thrRows.filter(r=>r.hit).length}/${thrRows.length} hit (${pct(mean(thrRows.map(r=>r.hit)))})`:'none'}.</div>
+  </div>
+  <h3>How each category tracked with real results</h3>
+  <div class="tablewrap"><table class="logtbl"><thead><tr><th>Category</th><th style="width:34%">Correlation with hitting (−0.4 … +0.4)</th><th>Corr.</th><th>Scored 7+ → hit</th><th>Scored ≤4 → hit</th><th>Difference</th><th>Verdict</th></tr></thead><tbody>
+  ${[...sorted].reverse().concat([overall]).map(m=>`<tr${m===overall?' style="border-top:2px solid var(--line)"':''}><td><b>${esc(m.label)}</b></td><td>${bar(m.c)}</td><td class="num">${m.c.toFixed(2)}</td>
+    <td class="num">${fp(m.hi)} <small class="muted">(${m.hiN})</small></td><td class="num">${fp(m.lo)} <small class="muted">(${m.loN})</small></td>
+    <td class="num ${m.lift==null?'':m.lift>=0?'hit':'miss'}">${m.lift==null?'—':(m.lift>=0?'+':'')+Math.round(m.lift*100)+' pts'}</td><td>${impact(m.c)}</td></tr>`).join('')}
+  </tbody></table></div>
+  <p class="note">How to read it: correlation near 0 means that category's score had no relationship with whether the Over hit; positive means higher scores hit more; negative means it pointed the wrong way. One day is a small sample (a few hundred picks) — run 7 or 14 days for a steadier answer. Limits: lines are each player's recent-average line, not sportsbook lines; players who didn't play are treated as having been out; team defense and standings use today's season numbers.</p>`;
+}
+$('#btStat').innerHTML='<option value="">All stats</option>'+STATS.map(s=>`<option value="${s.k}">${s.k}</option>`).join('');
+{const y=new Date();y.setDate(y.getDate()-1);$('#btDate').value=localYMD(y);}
+$('#btRun').onclick=runBacktest;
 
 $('#date').value=localYMD(new Date());
 renderTable();
