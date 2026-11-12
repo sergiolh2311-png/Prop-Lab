@@ -568,19 +568,25 @@ function analyze(p,stat,line,side,N){
   C.usage={s:clamp(flip(clamp(u,1,10)),1,10),
     note:`${r1(avgMin)} min/g (L3 ${r1(l3min)}). ${role}.${outs.length?` Teammates out: ${outs.map(o=>o.short||o.name).join(', ')}.`:''}`};
 
-  // 6 Game environment
-  let env=5; const eb=[];
-  if(game.total){env+=(game.total-S.leagueTotal)/4;eb.push(`Total ${game.total} (slate avg ${r1(S.leagueTotal)})`)}
-  else eb.push('No total posted');
-  if(game.spread!=null){
-    if(game.spread>=12){env-=2.5;eb.push(`spread ${game.spread} — high blowout risk`)}
-    else if(game.spread>=9){env-=1.5;eb.push(`spread ${game.spread} — blowout risk`)}
-    else if(game.spread<=3){env+=1;eb.push(`spread ${game.spread} — close game, OT possible`)}
-    else eb.push(`spread ${game.spread}`);
+  // 6 Game environment — close game = high; likely blowout vs an underperforming opponent = low
+  const eb=[]; let spread=game.spread, est=false;
+  if(spread==null){const ra=S.ranks[p.teamId],rb=S.ranks[p.oppId];
+    if(ra&&rb&&isFinite(ra.pf)&&isFinite(rb.pf)){spread=r1(Math.abs((ra.pf-ra.pa)-(rb.pf-rb.pa)+(p.home?2.5:-2.5)));est=true}}
+  let env;
+  if(spread==null){env=6;eb.push('No spread available')}
+  else{
+    env=spread<=3?9.5:spread<=5?8.5:spread<=7?7:spread<=9?5.5:spread<=12?4:2.5;
+    const lab=spread<=3?'coin-flip game, OT possible':spread<=5?'close game expected':spread<=7?'competitive':spread<=9?'some blowout risk':spread<=12?'blowout risk':'likely blowout';
+    eb.push(`${est?'Est. spread':'Spread'} ${spread} — ${lab}`);
   }
-  const bw=blowoutTeams().filter(a=>a===p.team||a===p.opp);
-  if(bw.length){env-=1;eb.push(`blowout watch: ${bw.map(x=>x+' ('+bwReason(x)+')').join('; ')}`)}
-  C.env={s:clamp(over?env:10-env,1,10),note:eb.join(' · ')+'.'};
+  const bwl=blowoutTeams(), blowoutLikely=spread!=null&&spread>=9;
+  if(bwl.includes(p.opp)){
+    if(blowoutLikely){env-=2.5;eb.push(`${p.opp} underperforming (${bwReason(p.opp)}) — starters may sit late`)}
+    else{env-=0.5;eb.push(`${p.opp} underperforming (${bwReason(p.opp)})`)}
+  }
+  if(bwl.includes(p.team)&&blowoutLikely){env-=1;eb.push(`${p.team} underperforming — could be on the wrong end of a blowout`)}
+  if(game.total){const t=clamp((game.total-S.leagueTotal)/6,-1,1);env+=t;eb.push(`total ${game.total} (slate avg ${r1(S.leagueTotal)})`)}
+  C.env={s:clamp(over?env:11-env,1,10),note:eb.join(' · ')+'.'};
 
   for(const k in C) C[k].s=r1(C[k].s);
   const score=r1(mean(Object.values(C).map(c=>c.s)));
@@ -680,7 +686,7 @@ function qualPicks(p){
   if(!S.logs[p.id]||/^out$/i.test(p.inj)) return [];
   const out=[];
   for(const st of STATS){const line=getLine(p.id,st.k);
-    for(const side of (isBin(st.k)?['over']:['over','under'])){const a=analyze(p,st.k,line,side,S.win);
+    for(const side of ['over']){const a=analyze(p,st.k,line,side,S.win);
       if(a&&a.score>=S.thr) out.push({pid:p.id,stat:st.k,side,line,score:a.score,hr:a.hr});}}
   return out.sort((x,y)=>y.score-x.score);
 }
