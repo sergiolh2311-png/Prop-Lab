@@ -193,7 +193,7 @@ h3{font-family:"Barlow Condensed",sans-serif;font-size:20px;margin:18px 0 8px;le
       <tbody></tbody>
     </table>
   </div>
-  <p class="note">Data: ESPN public feeds (scoreboard, rosters, injuries, game logs, standings). Defensive rank uses opponent points allowed per game — position-specific DvP isn't available from this feed. Scores are a framework for judging picks, not a guarantee.</p>
+  <p class="note">Data: ESPN public feeds (scoreboard, rosters, injuries, game logs, standings). Defensive pressure ranks the opponent on the stat you are viewing (steals allowed for STL, rebounds allowed for REB, etc.) from ESPN team opponent stats, or from players' game logs vs that team if that feed is unavailable. Scores are a framework for judging picks, not a guarantee.</p>
 </section>
 
 <section id="view-picks" hidden>
@@ -233,6 +233,70 @@ const isBin=k=>!!(STATS.find(s=>s.k===k)||{}).binary;
 const fmtS=(k,v)=>isBin(k)?pct(v):r1(v);
 const starVal=pid=>{const g=gamesBefore(pid);if(!g||!g.length)return -1;return mean(g.slice(0,10).map(x=>x.pts+x.reb+x.ast))};
 const statFn = k => STATS.find(s=>s.k===k).f;
+/* ===== Stat-specific defense: what each team ALLOWS opponents per game ===== */
+const OPP_KEYS={PTS:['avgPoints'],REB:['avgRebounds'],AST:['avgAssists'],STL:['avgSteals'],BLK:['avgBlocks'],'3PM':['avgThreePointFieldGoalsMade']};
+const STAT_PARTS={PTS:['PTS'],REB:['REB'],AST:['AST'],STL:['STL'],BLK:['BLK'],'3PM':['3PM'],PRA:['PTS','REB','AST'],PR:['PTS','REB'],PA:['PTS','AST'],RA:['REB','AST'],'STL+BLK':['STL','BLK'],DD:['PTS','REB','AST']};
+const STAT_NAME={PTS:'PTS',REB:'REB',AST:'AST',STL:'STL',BLK:'BLK','3PM':'3PM'};
+function parseByTeam(j){
+  const defs=j.categories||[]; const out={};
+  for(const t of (j.teams||[])){
+    const id=String((t.team||{}).id||''); if(!id) continue; const m={};
+    for(const c of (t.categories||[])){
+      const def=defs.find(x=>x.name===c.name)||{}; const names=c.names||def.names||[];
+      (c.values||[]).forEach((v,i)=>{if(names[i]!=null)m[names[i]]=Number(v)});
+    }
+    out[id]=m;
+  }
+  return out;
+}
+async function loadOppStats(){
+  S.oppStats=null; S.oppSrc='';
+  const yr=seasonEndYear(S.date);
+  const base='https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/statistics/byteam?region=us&lang=en&contentorigin=espn&limit=50';
+  const urls=[`${base}&category=opponent&season=${yr}&seasontype=2`,`${base}&category=opponent`,`${base}&view=opponent&season=${yr}&seasontype=2`];
+  for(const u of urls){
+    try{
+      const m=parseByTeam(await getJSON(u));
+      const ids=Object.keys(m).filter(id=>isFinite(m[id].avgPoints)&&isFinite(m[id].avgSteals));
+      if(ids.length<20) continue;
+      // Safety check: points allowed must match the standings, otherwise this isn't opponent data.
+      const chk=ids.filter(id=>S.ranks[id]&&isFinite(S.ranks[id].pa)).slice(0,10);
+      if(chk.length>=3 && chk.every(id=>Math.abs(m[id].avgPoints-S.ranks[id].pa)<=2)){S.oppStats=m;S.oppSrc='ESPN team opponent stats';return}
+    }catch(e){}
+  }
+}
+/* Fallback: from loaded game logs, how players do vs each team relative to their own average. */
+let _relCache={k:'',v:{}};
+function relAllowed(part){
+  const ck=part+'|'+Object.keys(S.logs).length+'|'+S.date;
+  if(_relCache.k===ck) return _relCache.v;
+  const f=statFn(part), acc={};
+  for(const p of S.players){
+    const g=gamesBefore(p.id); if(!g||g.length<5) continue;
+    const avg=mean(g.map(f)); if(avg<0.3) continue;
+    for(const x of g){ if(!x.oppId||x.oppId===p.teamId) continue; const a=acc[x.oppId]||(acc[x.oppId]={v:0,b:0,n:0}); a.v+=f(x); a.b+=avg; a.n++; }
+  }
+  const out={}; for(const id in acc){ if(acc[id].n>=12) out[id]={ratio:acc[id].v/acc[id].b,n:acc[id].n}; }
+  _relCache={k:ck,v:out}; return out;
+}
+/* Rank opponent for a stat: rank 1 = allows the least (toughest). */
+function defForStat(stat,oppId){
+  const parts=STAT_PARTS[stat]||['PTS'];
+  if(S.oppStats){
+    const val=id=>{let t=0;for(const pt of parts){const v=S.oppStats[id]&&S.oppStats[id][OPP_KEYS[pt][0]];if(!isFinite(v))return NaN;t+=v}return t};
+    const ids=Object.keys(S.oppStats).filter(id=>isFinite(val(id))).sort((a,b)=>val(a)-val(b));
+    const r=ids.indexOf(String(oppId));
+    if(r>=0) return {rank:r+1,n:ids.length,value:val(oppId),src:'opp',label:parts.join('+')};
+  }
+  // fallback: player-relative factor from game logs (combine parts by averaging ratios)
+  const maps=parts.map(relAllowed); const ids=Object.keys(maps[0]).filter(id=>maps.every(m=>m[id]));
+  if(ids.length>=8&&maps.every(m=>m[oppId])){
+    const val=id=>mean(maps.map(m=>m[id].ratio));
+    ids.sort((a,b)=>val(a)-val(b));
+    return {rank:ids.indexOf(String(oppId))+1,n:ids.length,ratio:val(oppId),src:'rel',label:parts.join('+'),samples:maps[0][oppId].n};
+  }
+  return null;
+}
 const CATS = [
   ['hist','Historical vs. line'],
   ['form','Consistency & form'],
@@ -477,8 +541,13 @@ function analyze(p,stat,line,side,N){
   C.match={s:wsum?clamp(10*parts.reduce((a,b)=>a+b[0]*b[1],0)/wsum,1,10):5, note:bits.join('. ')+'.'};
 
   // 4 Defensive pressure
-  if(oppRank){const base=1+9*(oppRank.rank-1)/Math.max(1,S.nTeams-1);
-    C.def={s:clamp(flip(base),1,10),note:`${p.opp} allow ${r1(oppRank.pa)} PPG — #${oppRank.rank} of ${S.nTeams} (1 = toughest). ${oppRank.rank<=10?'Tough':oppRank.rank<=20?'Average':'Soft'} defense.`}}
+  const dr=defForStat(stat,p.oppId);
+  const tier=(r,n)=>r<=n/3?'Tough':r<=2*n/3?'Average':'Soft';
+  if(dr){const base=1+9*(dr.rank-1)/Math.max(1,dr.n-1);
+    const what=dr.src==='opp'?`${p.opp} allow ${r1(dr.value)} ${dr.label} per game`:`players put up ${Math.round(dr.ratio*100)}% of their usual ${dr.label} vs ${p.opp} (${dr.samples} games)`;
+    C.def={s:clamp(flip(base),1,10),note:`${what} — #${dr.rank} of ${dr.n} (1 = allows least). ${tier(dr.rank,dr.n)} vs ${dr.label}.`}}
+  else if(oppRank){const base=1+9*(oppRank.rank-1)/Math.max(1,S.nTeams-1);
+    C.def={s:clamp(flip(base),1,10),note:`${p.opp} allow ${r1(oppRank.pa)} PPG — #${oppRank.rank} of ${S.nTeams} (stat-specific data not available yet, using points).`}}
   else C.def={s:5,note:'Opponent defensive data unavailable — neutral.'};
 
   // 5 Usage & opportunity
@@ -526,6 +595,7 @@ async function loadSlate(){
   renderGames();
   setStatus(`${S.games.length} games — loading rosters & injuries…`);
   try{S.ranks=parseStandings(await getJSON(STANDINGS))}catch(e){S.ranks={}}
+  await loadOppStats();
   const jobs=[];
   for(const g of S.games){
     for(const [t,o,home] of [[g.home,g.away,true],[g.away,g.home,false]]){
