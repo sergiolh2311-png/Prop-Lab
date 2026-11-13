@@ -310,7 +310,7 @@ function defForStat(stat,oppId){
   }
   return null;
 }
-const DEFAULT_W={hist:.30,match:.25,form:.15,usage:.15,def:.10,env:.05};
+const DEFAULT_W={hist:.31,match:.25,form:.21,usage:.17,def:.03,env:.03};
 const W=()=>S.weights||DEFAULT_W;
 const wPct=k=>Math.round(100*W()[k]/Object.values(W()).reduce((a,b)=>a+b,0));
 const CATS = [
